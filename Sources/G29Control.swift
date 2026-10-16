@@ -77,6 +77,19 @@ enum IOErr {
     static let notOpen: UInt32 = 0xE00002CD
 }
 
+/// Runs a command-line tool and waits for it; returns its exit status (-1 if it couldn't start).
+@discardableResult
+func runTool(_ path: String, _ args: [String]) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    p.standardOutput = Pipe()
+    p.standardError = Pipe()
+    do { try p.run() } catch { return -1 }
+    p.waitUntilExit()
+    return p.terminationStatus
+}
+
 // MARK: - Model
 
 struct Axis: Identifiable {
@@ -141,6 +154,11 @@ final class WheelController: ObservableObject {
     /// The entry that last accepted a command; tried first.
     private var preferred: IOHIDDevice?
     private var settleWork: DispatchWorkItem?
+    /// Counts plug-ins, so delayed work can tell the wheel was replugged in the meantime.
+    private var plugCount = 0
+    private var plugTime = Date()
+    private var lastSteerChange = Date()
+    private var calibrationTimer: Timer?
     private var outputSize = 7
     private var axes: [UInt32: Axis] = [:]
     private var buttons = Set<Int>()
@@ -224,6 +242,9 @@ final class WheelController: ObservableObject {
             dirty = true
             connected = true
             lastWriteFailed = false
+            plugCount += 1
+            plugTime = Date()
+            lastSteerChange = Date()
         }
         updateIdentity()
 
@@ -256,12 +277,41 @@ final class WheelController: ObservableObject {
         } else if pid == G29.pidPS4 {
             addLog("The wheel's switch is on PS4. Move it to PS3 and replug for full Mac/PC support.", error: true)
         } else if autoApply {
-            if !applySettings(quietFailure: true) {
-                addLog("Wheel not ready yet — retrying…")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    guard let self = self, self.connected, self.settleWork == nil else { return }
-                    self.applySettings()
-                }
+            applyAfterCalibration()
+        }
+    }
+
+    /// After it's plugged in, the wheel calibrates (turns lock to lock) and then resets its
+    /// spring and rotation, so settings sent before it finishes are lost. Wait until the
+    /// wheel has been still for a moment (at most 15 s after plug-in), then apply.
+    private func applyAfterCalibration() {
+        calibrationTimer?.invalidate()
+        addLog("Waiting for the wheel to finish calibrating…")
+        let plug = plugCount
+        calibrationTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self = self, self.connected, self.plugCount == plug else { timer.invalidate(); return }
+            let now = Date()
+            let sincePlug = now.timeIntervalSince(self.plugTime)
+            let still = now.timeIntervalSince(self.lastSteerChange) >= 1.5
+            guard (still && sincePlug >= 4) || sincePlug >= 15 else { return }
+            timer.invalidate()
+            self.calibrationTimer = nil
+            self.applyAutomatically(plug: plug)
+        }
+    }
+
+    private func applyAutomatically(plug: Int) {
+        if applySettings(quietFailure: true) {
+            // send once more shortly after, in case the wheel was still busy and dropped it
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self = self, self.connected, self.plugCount == plug else { return }
+                self.applySettings(quietFailure: true, quiet: true)
+            }
+        } else {
+            addLog("Wheel not ready yet — retrying…")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self, self.connected, self.plugCount == plug else { return }
+                self.applySettings()
             }
         }
     }
@@ -273,6 +323,8 @@ final class WheelController: ObservableObject {
         if devices.isEmpty {
             settleWork?.cancel()
             settleWork = nil
+            calibrationTimer?.invalidate()
+            calibrationTimer = nil
             connected = false
             axes = [:]
             buttons = []
@@ -296,6 +348,7 @@ final class WheelController: ObservableObject {
             if usage == UInt32(kHIDUsage_GD_Hatswitch) {
                 hat = v
             } else if let n = axisName(usage) {
+                if usage == 0x30 && axes[usage]?.value != v { lastSteerChange = Date() }
                 if var a = axes[usage] {
                     a.value = v
                     axes[usage] = a
@@ -407,21 +460,21 @@ final class WheelController: ObservableObject {
     }
 
     @discardableResult
-    func applySettings(quietFailure: Bool = false) -> Bool {
+    func applySettings(quietFailure: Bool = false, quiet: Bool = false) -> Bool {
         guard connected else { addLog("No wheel connected", error: true); return false }
         if pid == G29.pidCompat {
             addLog("Switch to native mode first (button at the top).", error: true)
             return false
         }
         let deg = Int(rangeDegrees)
-        guard send(G29.range(deg), "Rotation set to \(deg)°", quietFailure: quietFailure) else { return false }
+        guard send(G29.range(deg), "Rotation set to \(deg)°", quiet: quiet, quietFailure: quietFailure) else { return false }
         let c = Int(centering)
         if c == 0 {
-            send(G29.centeringOff, "Centering spring off (free wheel)")
-        } else if send(G29.centering(percent: c), "Centering spring \(c)%") {
-            send(G29.centeringActivate, "activate", quiet: true)
+            send(G29.centeringOff, "Centering spring off (free wheel)", quiet: quiet, quietFailure: quietFailure)
+        } else if send(G29.centering(percent: c), "Centering spring \(c)%", quiet: quiet, quietFailure: quietFailure) {
+            send(G29.centeringActivate, "activate", quiet: true, quietFailure: quietFailure)
         }
-        flashLEDs()
+        if !quiet { flashLEDs() }
         return true
     }
 
@@ -451,24 +504,12 @@ final class WheelController: ObservableObject {
 
     // MARK: G HUB
 
-    @discardableResult
-    private func run(_ path: String, _ args: [String]) -> Int32 {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        p.standardOutput = Pipe()
-        p.standardError = Pipe()
-        do { try p.run() } catch { return -1 }
-        p.waitUntilExit()
-        return p.terminationStatus
-    }
-
     func checkGHub() {
-        gHubRunning = run("/usr/bin/pgrep", ["-i", "lghub"]) == 0
+        gHubRunning = runTool("/usr/bin/pgrep", ["-i", "lghub"]) == 0
     }
 
     func quitGHub() {
-        run("/usr/bin/pkill", ["-i", "lghub"])
+        runTool("/usr/bin/pkill", ["-i", "lghub"])
         addLog("Asked Logitech G HUB to quit")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self = self else { return }
@@ -512,20 +553,249 @@ final class WheelController: ObservableObject {
     }
 }
 
+// MARK: - Updates (from GitHub Releases)
+
+struct AppRelease {
+    let version: String
+    let notes: String
+    let page: URL
+    let zip: URL?
+}
+
+final class Updater: ObservableObject {
+    static let repo = "thisisyusub/G29Control"
+    static let currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
+
+    @Published var available: AppRelease?
+    @Published var checking = false
+    @Published var installing = false
+
+    @Published var autoCheck: Bool = (UserDefaults.standard.object(forKey: "autoCheckUpdates") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(autoCheck, forKey: "autoCheckUpdates") }
+    }
+
+    private let log: (String, Bool) -> Void
+    private var timer: Timer?
+
+    init(log: @escaping (String, Bool) -> Void) {
+        self.log = log
+        // check shortly after launch, then once a day while the app keeps running
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self = self, self.autoCheck else { return }
+            self.check(userInitiated: false)
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
+            guard let self = self, self.autoCheck else { return }
+            self.check(userInitiated: false)
+        }
+    }
+
+    /// "1.10.0" > "1.9.2"; missing parts count as 0.
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    private struct GitHubRelease: Decodable {
+        struct Asset: Decodable {
+            let name: String
+            let browser_download_url: URL
+        }
+        let tag_name: String
+        let html_url: URL
+        let body: String?
+        let assets: [Asset]
+    }
+
+    func check(userInitiated: Bool) {
+        guard !checking, !installing else { return }
+        checking = true
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 30
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let release = data.flatMap { try? JSONDecoder().decode(GitHubRelease.self, from: $0) }
+            DispatchQueue.main.async {
+                self.checking = false
+                guard status == 200, let r = release else {
+                    let reason = error?.localizedDescription ?? "GitHub answered with status \(status)"
+                    self.log("Update check failed: \(reason)", true)
+                    if userInitiated { self.alert("Couldn't check for updates", reason) }
+                    return
+                }
+                let version = r.tag_name.hasPrefix("v") ? String(r.tag_name.dropFirst()) : r.tag_name
+                guard Self.isNewer(version, than: Self.currentVersion) else {
+                    self.available = nil
+                    if userInitiated {
+                        self.alert("You're up to date", "G29 Control \(Self.currentVersion) is the latest version.")
+                    }
+                    return
+                }
+                let zip = r.assets.first { $0.name == "G29Control.zip" }?.browser_download_url
+                let release = AppRelease(version: version, notes: r.body ?? "", page: r.html_url, zip: zip)
+                let isNew = self.available?.version != version
+                self.available = release
+                if isNew { self.log("Update available: G29 Control \(version) (you have \(Self.currentVersion))", false) }
+                if userInitiated { self.offer(release) }
+            }
+        }.resume()
+    }
+
+    private func offer(_ r: AppRelease) {
+        let a = NSAlert()
+        a.messageText = "G29 Control \(r.version) is available"
+        let notes = r.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        a.informativeText = "You have \(Self.currentVersion)."
+            + (notes.isEmpty ? "" : "\n\n" + String(notes.prefix(1200)))
+        a.addButton(withTitle: "Install and Relaunch")
+        a.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn { install() }
+    }
+
+    private func alert(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
+    /// The app can replace itself only from a writable folder (not the disk image, and not
+    /// the read-only copy macOS runs when the app was opened straight from Downloads).
+    private var canReplaceInPlace: Bool {
+        let app = Bundle.main.bundleURL
+        let fm = FileManager.default
+        return !app.path.contains("/AppTranslocation/")
+            && fm.isWritableFile(atPath: app.deletingLastPathComponent().path)
+            && fm.isWritableFile(atPath: app.path)
+    }
+
+    func install() {
+        guard let r = available, !installing else { return }
+        guard let zip = r.zip, canReplaceInPlace else {
+            alert("Install the update manually",
+                  "G29 Control can't replace itself from where it's running. Download \(r.version) from the release page and drag it into Applications.")
+            NSWorkspace.shared.open(r.page)
+            return
+        }
+        installing = true
+        log("Downloading G29 Control \(r.version)…", false)
+        URLSession.shared.downloadTask(with: zip) { file, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let result: Result<URL, Error>
+            if let file = file, status == 200 {
+                result = Result { try Self.unpack(file, expecting: r.version) }
+            } else {
+                result = .failure(UpdateError(error?.localizedDescription ?? "Download failed (status \(status))"))
+            }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let newApp):
+                    self.log("Installing G29 Control \(r.version) and relaunching…", false)
+                    self.relaunch(into: newApp)
+                case .failure(let e):
+                    self.installing = false
+                    self.log("Update failed: \(e.localizedDescription)", true)
+                    self.alert("Update failed", "\(e.localizedDescription)\n\nYou can download it from the release page instead.")
+                    NSWorkspace.shared.open(r.page)
+                }
+            }
+        }.resume()
+    }
+
+    struct UpdateError: LocalizedError {
+        let errorDescription: String?
+        init(_ text: String) { errorDescription = text }
+    }
+
+    /// Unzips the download and checks it's an intact G29 Control of the expected version.
+    private static func unpack(_ download: URL, expecting version: String) throws -> URL {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("G29Control-update-\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let zip = dir.appendingPathComponent("G29Control.zip")
+        try fm.moveItem(at: download, to: zip)
+        guard runTool("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]) == 0 else {
+            throw UpdateError("Couldn't unzip the update.")
+        }
+        guard let app = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+                .first(where: { $0.pathExtension == "app" }),
+              let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist")),
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+              info["CFBundleShortVersionString"] as? String == version else {
+            throw UpdateError("The download isn't the expected G29 Control \(version).")
+        }
+        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) == 0 else {
+            throw UpdateError("The downloaded app's signature is broken.")
+        }
+        runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+        return app
+    }
+
+    /// Quits, then a small shell script swaps the app bundle (restoring the old one if
+    /// that fails) and opens it again.
+    private func relaunch(into newApp: URL) {
+        let dest = Bundle.main.bundleURL.path
+        let old = newApp.deletingLastPathComponent().appendingPathComponent("previous.app").path
+        let script = """
+        while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+        mv "$3" "$4" || { open "$3"; exit 1; }
+        if mv "$2" "$3"; then rm -rf "$4"; else mv "$4" "$3"; fi
+        open "$3"
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script, "sh", String(ProcessInfo.processInfo.processIdentifier),
+                       newApp.path, dest, old]
+        do {
+            try p.run()
+        } catch {
+            installing = false
+            log("Update failed: couldn't start the installer (\(error.localizedDescription))", true)
+            return
+        }
+        NSApp.terminate(nil)
+    }
+}
+
 // MARK: - App
 
 @main
 struct G29ControlApp: App {
-    @StateObject private var wheel = WheelController()
+    @StateObject private var wheel: WheelController
+    @StateObject private var updater: Updater
     @AppStorage("showMenuBar") private var showMenuBar = true
+
+    init() {
+        let wheel = WheelController()
+        _wheel = StateObject(wrappedValue: wheel)
+        _updater = StateObject(wrappedValue: Updater { [weak wheel] text, error in
+            wheel?.addLog(text, error: error)
+        })
+    }
 
     var body: some Scene {
         Window("G29 Control", id: "main") {
             MainView()
                 .environmentObject(wheel)
+                .environmentObject(updater)
                 .frame(minWidth: 1000, minHeight: 680)
         }
         .windowToolbarStyle(.unified)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { updater.check(userInitiated: true) }
+                    .disabled(updater.checking || updater.installing)
+            }
+        }
 
         Window("Activity", id: "activity") {
             ActivityView()
@@ -536,11 +806,13 @@ struct G29ControlApp: App {
         Settings {
             PreferencesView()
                 .environmentObject(wheel)
+                .environmentObject(updater)
         }
 
         MenuBarExtra("G29 Control", systemImage: "steeringwheel", isInserted: $showMenuBar) {
             MenuBarContent()
                 .environmentObject(wheel)
+                .environmentObject(updater)
         }
     }
 }
@@ -717,9 +989,19 @@ struct Backdrop: View {
 
 struct AlertsView: View {
     @EnvironmentObject var wheel: WheelController
+    @EnvironmentObject var updater: Updater
 
     var body: some View {
         VStack(spacing: 10) {
+            if let update = updater.available {
+                AlertRow(icon: "arrow.down.app.fill",
+                         title: "G29 Control \(update.version) is available",
+                         message: updater.installing
+                            ? "Downloading… the app relaunches when it's done."
+                            : "You have \(Updater.currentVersion). The app relaunches to finish installing.",
+                         action: updater.installing ? nil : "Install Update",
+                         tint: .accentColor) { updater.install() }
+            }
             if wheel.gHubRunning {
                 AlertRow(icon: "lock.fill",
                          title: "Logitech G HUB is running",
@@ -752,13 +1034,14 @@ struct AlertRow: View {
     let title: String
     let message: String
     var action: String? = nil
+    var tint: Color = .orange
     var perform: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: icon)
                 .font(.title2)
-                .foregroundColor(.orange)
+                .foregroundColor(tint)
                 .frame(width: 30)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.headline)
@@ -770,7 +1053,7 @@ struct AlertRow: View {
             }
         }
         .padding(14)
-        .glassCard(cornerRadius: 16, tint: .orange)
+        .glassCard(cornerRadius: 16, tint: tint)
     }
 }
 
@@ -1206,6 +1489,7 @@ struct ActivityView: View {
 
 struct PreferencesView: View {
     @EnvironmentObject var wheel: WheelController
+    @EnvironmentObject var updater: Updater
     @AppStorage("showMenuBar") private var showMenuBar = true
 
     var body: some View {
@@ -1220,9 +1504,19 @@ struct PreferencesView: View {
                     .font(.callout)
                     .foregroundColor(.secondary)
             }
+            Section("Updates") {
+                Toggle("Check for updates automatically", isOn: $updater.autoCheck)
+                HStack {
+                    Text("Version \(Updater.currentVersion)")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("Check Now") { updater.check(userInitiated: true) }
+                        .disabled(updater.checking || updater.installing)
+                }
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 280)
+        .frame(width: 460, height: 400)
     }
 }
 
@@ -1230,6 +1524,7 @@ struct PreferencesView: View {
 
 struct MenuBarContent: View {
     @EnvironmentObject var wheel: WheelController
+    @EnvironmentObject var updater: Updater
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -1254,6 +1549,13 @@ struct MenuBarContent: View {
             }
         }
         Divider()
+        if let update = updater.available {
+            Button("Install Update \(update.version)…") { updater.install() }
+                .disabled(updater.installing)
+        } else {
+            Button("Check for Updates…") { updater.check(userInitiated: true) }
+                .disabled(updater.checking)
+        }
         Button("Open G29 Control") {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "main")

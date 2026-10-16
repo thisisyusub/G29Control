@@ -37,7 +37,8 @@ G29 Control is a small, native Mac app that fixes these problems with one click.
 | **Rotation range** | 40–900°, with quick 180 / 270 / 540 / 900° presets |
 | **Native mode switch** | Switches the wheel to native G29 mode automatically: separate gas, brake and clutch |
 | **Live dashboard** | Steering angle, every pedal, buttons and D-pad, updated in real time |
-| **Auto-apply** | Your settings go to the wheel every time it's plugged in |
+| **Auto-apply** | Your settings go to the wheel every time it's plugged in, once it has finished calibrating |
+| **Automatic updates** | Checks GitHub for new releases, then downloads, installs and relaunches in one click |
 | **Menu bar controls** | Rotation and centering presets, even with the window closed |
 | **Force feedback and rev-light tests** | Check that the motor and LEDs respond |
 | **G HUB detection** | Warns when G HUB is locking the wheel and offers to quit it |
@@ -94,7 +95,7 @@ cd G29Control
 3. **Choose the feel you want:**
    - *Centering spring* **0%** gives a free, soft wheel. **10–20%** gives a light pull to center.
    - *Rotation* **900°** gives realistic steering, while **270–540°** is quicker for arcade games.
-4. **Start your game.** Keep G29 Control running in the menu bar, so your settings are re-applied whenever the wheel reconnects.
+4. **Start your game.** Keep G29 Control running in the menu bar, so your settings are re-applied whenever the wheel reconnects (a few seconds after plug-in, when the wheel stops its calibration turn).
 
 ## Setting up the pedals in games
 
@@ -127,6 +128,12 @@ The game may list the axes in a different order from your pedals. The easiest wa
 | Settings lost after unplugging | Normal: the wheel forgets them. Keep the app in the menu bar with auto-apply on. |
 
 When reporting a bug, open **Activity → Copy Diagnostics** and paste the result into your issue.
+
+## Updates
+
+G29 Control checks for a new release when it starts and once a day after that. When one is available, a banner appears in the main window (and an item in the menu bar). Click **Install Update** and the app downloads the new version, replaces itself and relaunches. You can also use **G29 Control → Check for Updates…**, or turn off automatic checks in Settings (⌘,).
+
+In-place updates need the app to be in a folder you can write to, such as **Applications**. If it's running from the disk image, the app opens the release page instead. After an update, macOS may ask you to allow Input Monitoring again.
 
 ## How it works
 
