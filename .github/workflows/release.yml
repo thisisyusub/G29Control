@@ -1,0 +1,44 @@
+# Builds the app on every push, and publishes a GitHub Release
+# with the .dmg and .zip whenever you push a version tag (e.g. v1.0.0).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Newest Xcode = Liquid Glass UI on macOS 26 (older macOS gets the frosted look)
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build app
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          ./build.sh --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: G29Control
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/G29Control.dmg
+            dist/G29Control.zip
+          generate_release_notes: true
