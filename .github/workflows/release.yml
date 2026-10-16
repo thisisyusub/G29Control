@@ -34,10 +34,18 @@ jobs:
           name: G29Control
           path: dist/*
 
+      # Use the annotated tag's message as the release description
+      - name: Release notes from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > dist/RELEASE_NOTES.md
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: dist/RELEASE_NOTES.md
           files: |
             dist/G29Control.dmg
             dist/G29Control.zip

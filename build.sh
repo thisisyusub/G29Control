@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 MODE="${1:-}"
 APP_NAME="G29 Control"
 APP="build/$APP_NAME.app"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.0.1}"
 
 if ! command -v swiftc >/dev/null 2>&1; then
   echo "Swift compiler not found. Run:  xcode-select --install   then run this script again."

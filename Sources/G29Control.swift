@@ -135,7 +135,12 @@ final class WheelController: ObservableObject {
     @Published var ledCount: Double = 0
 
     private var manager: IOHIDManager!
-    private var device: IOHIDDevice?
+    /// macOS can report one wheel as several HID entries (one per USB interface),
+    /// and only some of them accept commands, so keep them all.
+    private var devices: [IOHIDDevice] = []
+    /// The entry that last accepted a command; tried first.
+    private var preferred: IOHIDDevice?
+    private var settleWork: DispatchWorkItem?
     private var outputSize = 7
     private var axes: [UInt32: Axis] = [:]
     private var buttons = Set<Int>()
@@ -198,42 +203,84 @@ final class WheelController: ObservableObject {
         return (IOHIDDeviceGetProperty(dev, key as CFString) as? NSNumber)?.intValue
     }
 
+    private func outputSize(of dev: IOHIDDevice) -> Int {
+        return max(7, intProp(dev, kIOHIDMaxOutputReportSizeKey) ?? 7)
+    }
+
     func attached(_ dev: IOHIDDevice) {
-        device = dev
+        guard !devices.contains(where: { CFEqual($0, dev) }) else { return }
+        devices.append(dev)
+        addLog(String(format: "USB interface found: 0x%04X, usage %02X:%02X, output %d bytes, input %d bytes",
+                      intProp(dev, kIOHIDProductIDKey) ?? 0,
+                      intProp(dev, kIOHIDPrimaryUsagePageKey) ?? 0,
+                      intProp(dev, kIOHIDPrimaryUsageKey) ?? 0,
+                      intProp(dev, kIOHIDMaxOutputReportSizeKey) ?? 0,
+                      intProp(dev, kIOHIDMaxInputReportSizeKey) ?? 0))
+
+        if !connected {
+            axes = [:]
+            buttons = []
+            hat = 8
+            dirty = true
+            connected = true
+            lastWriteFailed = false
+        }
+        updateIdentity()
+
+        // macOS may report more entries in quick succession: act once, after it has finished
+        settleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.settled() }
+        settleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    private func updateIdentity() {
+        guard let dev = preferred ?? devices.first else { return }
         pid = intProp(dev, kIOHIDProductIDKey) ?? 0
         name = (IOHIDDeviceGetProperty(dev, kIOHIDProductKey as CFString) as? String) ?? "Logitech wheel"
-        outputSize = max(7, intProp(dev, kIOHIDMaxOutputReportSizeKey) ?? 7)
-        axes = [:]
-        buttons = []
-        hat = 8
-        dirty = true
-        connected = true
-        lastWriteFailed = false
+        outputSize = outputSize(of: dev)
+    }
+
+    /// Runs once per plug-in, 2 s after the last entry appeared
+    /// (this also lets the wheel finish its power-on calibration).
+    private func settled() {
+        settleWork = nil
+        guard connected else { return }
+        updateIdentity()
         addLog("Connected: \(name) — \(G29.modeName(pid)) (output report \(outputSize) bytes)")
         checkGHub()
 
         if pid == G29.pidCompat {
             addLog("Gas and brake are combined in this mode — that's why releasing gas brakes the car.")
-            if autoNative {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.switchToNative() }
-            }
+            if autoNative { switchToNative() }
         } else if pid == G29.pidPS4 {
             addLog("The wheel's switch is on PS4. Move it to PS3 and replug for full Mac/PC support.", error: true)
         } else if autoApply {
-            // let the wheel finish its power-on calibration first
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.applySettings() }
+            if !applySettings(quietFailure: true) {
+                addLog("Wheel not ready yet — retrying…")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    guard let self = self, self.connected, self.settleWork == nil else { return }
+                    self.applySettings()
+                }
+            }
         }
     }
 
     func removed(_ dev: IOHIDDevice) {
-        if let d = device, CFEqual(d, dev) {
-            device = nil
+        guard let i = devices.firstIndex(where: { CFEqual($0, dev) }) else { return }
+        devices.remove(at: i)
+        if let p = preferred, CFEqual(p, dev) { preferred = nil }
+        if devices.isEmpty {
+            settleWork?.cancel()
+            settleWork = nil
             connected = false
             axes = [:]
             buttons = []
             raw = []
             dirty = true
             addLog("Wheel disconnected")
+        } else {
+            updateIdentity()
         }
     }
 
@@ -310,23 +357,38 @@ final class WheelController: ObservableObject {
     // MARK: Commands
 
     @discardableResult
-    func send(_ bytes: [UInt8], _ label: String, quiet: Bool = false) -> Bool {
-        guard let dev = device else {
+    func send(_ bytes: [UInt8], _ label: String, quiet: Bool = false, quietFailure: Bool = false) -> Bool {
+        guard !devices.isEmpty else {
             addLog("No wheel connected", error: true)
             return false
         }
-        var buf = [UInt8](repeating: 0, count: outputSize)
-        for (i, b) in bytes.enumerated() where i < buf.count { buf[i] = b }
-        let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, buf, buf.count)
-        if r != kIOReturnSuccess {
-            lastWriteFailed = true
-            addLog("\(label) failed: \(describe(r))", error: true)
-            explain(r)
-            return false
+        // try the entry that worked last time first, then every other one
+        var candidates = devices
+        if let p = preferred, let i = candidates.firstIndex(where: { CFEqual($0, p) }) {
+            candidates.insert(candidates.remove(at: i), at: 0)
         }
-        lastWriteFailed = false
-        if !quiet { addLog("\(label) ✓") }
-        return true
+        var firstError: IOReturn = kIOReturnSuccess
+        for dev in candidates {
+            var buf = [UInt8](repeating: 0, count: outputSize(of: dev))
+            for (i, b) in bytes.enumerated() where i < buf.count { buf[i] = b }
+            let r = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, buf, buf.count)
+            if r == kIOReturnSuccess {
+                if preferred == nil || !CFEqual(preferred!, dev) {
+                    preferred = dev
+                    updateIdentity()
+                }
+                lastWriteFailed = false
+                if !quiet { addLog("\(label) ✓") }
+                return true
+            }
+            if firstError == kIOReturnSuccess { firstError = r }
+        }
+        lastWriteFailed = true
+        if !quietFailure {
+            addLog("\(label) failed: \(describe(firstError))", error: true)
+            explain(firstError)
+        }
+        return false
     }
 
     private func explain(_ r: IOReturn) {
@@ -344,14 +406,15 @@ final class WheelController: ObservableObject {
         }
     }
 
-    func applySettings() {
-        guard connected else { addLog("No wheel connected", error: true); return }
+    @discardableResult
+    func applySettings(quietFailure: Bool = false) -> Bool {
+        guard connected else { addLog("No wheel connected", error: true); return false }
         if pid == G29.pidCompat {
             addLog("Switch to native mode first (button at the top).", error: true)
-            return
+            return false
         }
         let deg = Int(rangeDegrees)
-        guard send(G29.range(deg), "Rotation set to \(deg)°") else { return }
+        guard send(G29.range(deg), "Rotation set to \(deg)°", quietFailure: quietFailure) else { return false }
         let c = Int(centering)
         if c == 0 {
             send(G29.centeringOff, "Centering spring off (free wheel)")
@@ -359,6 +422,7 @@ final class WheelController: ObservableObject {
             send(G29.centeringActivate, "activate", quiet: true)
         }
         flashLEDs()
+        return true
     }
 
     func switchToNative() {
