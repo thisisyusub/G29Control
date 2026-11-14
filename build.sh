@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 MODE="${1:-}"
 APP_NAME="G29 Control"
 APP="build/$APP_NAME.app"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.3.0}"
 
 if ! command -v swiftc >/dev/null 2>&1; then
   echo "Swift compiler not found. Run:  xcode-select --install   then run this script again."
@@ -31,6 +31,12 @@ for ARCH in arm64 x86_64; do
 done
 lipo -create build/G29Control-arm64 build/G29Control-x86_64 -output "$APP/Contents/MacOS/G29Control"
 rm build/G29Control-arm64 build/G29Control-x86_64
+
+# ETS2/ATS telemetry plugin for force feedback (installed into the game from the app)
+echo "Compiling the ETS2/ATS plugin…"
+clang -O2 -Wall -Wextra -dynamiclib -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
+  Plugin/g29_telemetry.c -o "$APP/Contents/Resources/g29control_ffb.dylib"
+codesign --force -s - "$APP/Contents/Resources/g29control_ffb.dylib"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

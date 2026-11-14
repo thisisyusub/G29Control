@@ -134,7 +134,10 @@ final class WheelController: ObservableObject {
     @Published var lastWriteFailed = false
 
     @Published var rangeDegrees: Double = (UserDefaults.standard.object(forKey: "range") as? Double) ?? 900 {
-        didSet { UserDefaults.standard.set(rangeDegrees, forKey: "range") }
+        didSet {
+            UserDefaults.standard.set(rangeDegrees, forKey: "range")
+            ffb?.setRange(rangeDegrees)
+        }
     }
     @Published var centering: Double = (UserDefaults.standard.object(forKey: "centering") as? Double) ?? 0 {
         didSet { UserDefaults.standard.set(centering, forKey: "centering") }
@@ -146,6 +149,12 @@ final class WheelController: ObservableObject {
         didSet { UserDefaults.standard.set(autoNative, forKey: "autoNative") }
     }
     @Published var ledCount: Double = 0
+
+    /// Game force feedback; while it's active the wheel's own centering spring stays off.
+    var ffb: ForceFeedback? {
+        didSet { ffb?.setRange(rangeDegrees) }
+    }
+    var ffbActive = false
 
     private var manager: IOHIDManager!
     /// macOS can report one wheel as several HID entries (one per USB interface),
@@ -260,6 +269,7 @@ final class WheelController: ObservableObject {
         pid = intProp(dev, kIOHIDProductIDKey) ?? 0
         name = (IOHIDDeviceGetProperty(dev, kIOHIDProductKey as CFString) as? String) ?? "Logitech wheel"
         outputSize = outputSize(of: dev)
+        ffb?.setDevice(dev, outputSize: outputSize)
     }
 
     /// Runs once per plug-in, 2 s after the last entry appeared
@@ -330,6 +340,7 @@ final class WheelController: ObservableObject {
             buttons = []
             raw = []
             dirty = true
+            ffb?.setDevice(nil, outputSize: 7)
             addLog("Wheel disconnected")
         } else {
             updateIdentity()
@@ -358,6 +369,7 @@ final class WheelController: ObservableObject {
                     axes[usage] = Axis(usage: usage, name: n, min: mn, max: mx, value: v,
                                        restAtMax: (mx - v) < (v - mn))
                 }
+                if usage == 0x30, let x = axes[usage] { ffb?.updateWheel(position: x.normalized) }
             }
         }
         dirty = true
@@ -469,7 +481,9 @@ final class WheelController: ObservableObject {
         let deg = Int(rangeDegrees)
         guard send(G29.range(deg), "Rotation set to \(deg)°", quiet: quiet, quietFailure: quietFailure) else { return false }
         let c = Int(centering)
-        if c == 0 {
+        if ffbActive {
+            send(G29.centeringOff, "Centering spring off (game force feedback is on)", quiet: quiet, quietFailure: quietFailure)
+        } else if c == 0 {
             send(G29.centeringOff, "Centering spring off (free wheel)", quiet: quiet, quietFailure: quietFailure)
         } else if send(G29.centering(percent: c), "Centering spring \(c)%", quiet: quiet, quietFailure: quietFailure) {
             send(G29.centeringActivate, "activate", quiet: true, quietFailure: quietFailure)
@@ -550,6 +564,392 @@ final class WheelController: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         addLog("Log copied to clipboard")
+    }
+}
+
+// MARK: - Force feedback for ETS2 / ATS
+
+/// The Mac versions of ETS2 and ATS can't drive force feedback themselves. A small telemetry
+/// plugin (Plugin/g29_telemetry.c) sends the truck's state over UDP, and this engine turns it
+/// into forces: speed-dependent centering, low-speed weight, damping and road bumps. It runs
+/// on its own queue at 250 Hz and sends constant-force commands straight to the wheel.
+final class ForceFeedback: ObservableObject {
+    static let port: UInt16 = 39229
+    static let pluginName = "g29control_ffb.dylib"
+
+    struct Tuning {
+        var enabled = true
+        var strength = 0.6
+        var centering = 0.5
+        var road = 0.5
+        var weight = 0.5
+    }
+
+    struct TruckGame: Identifiable {
+        let name: String
+        let app: URL
+        var id: String { app.path }
+        var plugin: URL { app.appendingPathComponent("Contents/MacOS/plugins/\(ForceFeedback.pluginName)") }
+    }
+
+    enum PluginState { case notInstalled, installed, outdated }
+
+    @Published var games: [TruckGame] = []
+    @Published var pluginStates: [String: PluginState] = [:]
+    /// Telemetry is arriving (the game is running with the plugin).
+    @Published private(set) var receiving = false
+    @Published private(set) var receivingGame = ""
+
+    @Published var enabled: Bool = (UserDefaults.standard.object(forKey: "ffbEnabled") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(enabled, forKey: "ffbEnabled"); pushTuning() }
+    }
+    @Published var strength: Double = (UserDefaults.standard.object(forKey: "ffbStrength") as? Double) ?? 60 {
+        didSet { UserDefaults.standard.set(strength, forKey: "ffbStrength"); pushTuning() }
+    }
+    @Published var centering: Double = (UserDefaults.standard.object(forKey: "ffbCentering") as? Double) ?? 50 {
+        didSet { UserDefaults.standard.set(centering, forKey: "ffbCentering"); pushTuning() }
+    }
+    @Published var road: Double = (UserDefaults.standard.object(forKey: "ffbRoad") as? Double) ?? 50 {
+        didSet { UserDefaults.standard.set(road, forKey: "ffbRoad"); pushTuning() }
+    }
+    @Published var weight: Double = (UserDefaults.standard.object(forKey: "ffbWeight") as? Double) ?? 50 {
+        didSet { UserDefaults.standard.set(weight, forKey: "ffbWeight"); pushTuning() }
+    }
+
+    /// Called on the main queue when forces start (true) or stop (false) driving the wheel.
+    var onActiveChange: ((Bool) -> Void)?
+    var log: (String, Bool) -> Void = { _, _ in }
+
+    private let queue = DispatchQueue(label: "g29.ffb", qos: .userInteractive)
+    private var readSource: DispatchSourceRead?
+    private var timer: DispatchSourceTimer?
+
+    // Shared with the main thread, guarded by `lock`
+    private let lock = NSLock()
+    private var sharedDevice: IOHIDDevice?
+    private var sharedOutputSize = 7
+    private var sharedPosition = 0.5      // steering axis, 0…1
+    private var sharedRange = 900.0
+    private var sharedTuning = Tuning()
+
+    // Owned by `queue`
+    private struct Telemetry {
+        var paused = true
+        var engineOn = true
+        var game: UInt32 = 1
+        var simTime: UInt64 = 0
+        var speed: Float = 0
+        var accelX: Float = 0
+        var deflection: [Float] = [0, 0, 0, 0]
+    }
+    private var telemetry = Telemetry()
+    private var lastPacket: TimeInterval = 0
+    private var active = false
+    private var wasReceiving = false
+    private var activeSince: TimeInterval = 0
+    private var outputting = false
+    private var lastLevel = -1
+    private var lastSend: TimeInterval = 0
+    private var lastTick: TimeInterval = 0
+    private var lastAngle = 0.0
+    private var velocity = 0.0            // wheel speed, °/s (filtered)
+    private var bump = 0.0                // road kick, decays between packets
+    private var rumble = 0.0              // road vibration amplitude
+    private var phase = 0.0
+
+    init() {
+        pushTuning()
+        findGames()
+        startListening()
+    }
+
+    // MARK: Inputs from WheelController (main thread)
+
+    func setDevice(_ device: IOHIDDevice?, outputSize: Int) {
+        lock.lock(); sharedDevice = device; sharedOutputSize = outputSize; lock.unlock()
+    }
+
+    func updateWheel(position: Double) {
+        lock.lock(); sharedPosition = position; lock.unlock()
+    }
+
+    func setRange(_ degrees: Double) {
+        lock.lock(); sharedRange = degrees; lock.unlock()
+    }
+
+    private func pushTuning() {
+        let t = Tuning(enabled: enabled, strength: strength / 100, centering: centering / 100,
+                       road: road / 100, weight: weight / 100)
+        lock.lock(); sharedTuning = t; lock.unlock()
+    }
+
+    // MARK: Telemetry
+
+    private func startListening() {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { log("Force feedback: couldn't create a socket", true); return }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = Self.port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else {
+            close(fd)
+            DispatchQueue.main.async {
+                self.log("Force feedback: port \(Self.port) is in use (is G29 Control already running?)", true)
+            }
+            return
+        }
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 256)
+            while true {
+                let n = recv(fd, &buf, buf.count, 0)
+                if n <= 0 { break }
+                self?.parse(buf, count: n)
+            }
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        readSource = source
+
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .microseconds(500))
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    /// Layout matches g29_packet_t in Plugin/g29_telemetry.c.
+    private func parse(_ b: [UInt8], count: Int) {
+        guard count >= 64 else { return }
+        b.withUnsafeBytes { p in
+            guard p.loadUnaligned(fromByteOffset: 0, as: UInt32.self) == 0x54393247,
+                  p.loadUnaligned(fromByteOffset: 4, as: UInt32.self) == 1 else { return }
+            let flags = p.loadUnaligned(fromByteOffset: 8, as: UInt32.self)
+            let simTime = p.loadUnaligned(fromByteOffset: 16, as: UInt64.self)
+            var defl = [Float](repeating: 0, count: 4)
+            for i in 0..<4 { defl[i] = p.loadUnaligned(fromByteOffset: 48 + i * 4, as: Float.self) }
+
+            // Road feel: front suspension speed. A difference between left and right kicks
+            // the wheel sideways; any movement adds vibration.
+            let dt = Double(simTime &- telemetry.simTime) / 1_000_000
+            if dt > 0.001 && dt < 0.2 && telemetry.simTime != 0 {
+                let vl = Double(defl[0] - telemetry.deflection[0]) / dt
+                let vr = Double(defl[1] - telemetry.deflection[1]) / dt
+                bump = max(-1, min(1, bump + (vl - vr) * 0.6))
+                rumble = max(rumble, min(0.35, (abs(vl) + abs(vr)) * 0.25))
+            }
+
+            telemetry.paused = flags & 1 != 0
+            telemetry.engineOn = flags & 2 != 0
+            telemetry.game = p.loadUnaligned(fromByteOffset: 12, as: UInt32.self)
+            telemetry.simTime = simTime
+            telemetry.speed = p.loadUnaligned(fromByteOffset: 24, as: Float.self)
+            telemetry.accelX = p.loadUnaligned(fromByteOffset: 28, as: Float.self)
+            telemetry.deflection = defl
+        }
+        lastPacket = ProcessInfo.processInfo.systemUptime
+    }
+
+    // MARK: Force loop (250 Hz)
+
+    private func tick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastTick == 0 ? 0.004 : min(0.05, now - lastTick)
+        lastTick = now
+
+        lock.lock()
+        let device = sharedDevice, outputSize = sharedOutputSize
+        let position = sharedPosition, range = sharedRange, tuning = sharedTuning
+        lock.unlock()
+
+        // wheel angle and speed (low-pass filtered, ~25 ms)
+        let angle = (position - 0.5) * range
+        let rawVelocity = (angle - lastAngle) / dt
+        lastAngle = angle
+        velocity += (rawVelocity - velocity) * (dt / (0.025 + dt))
+
+        // "active" = game is sending data and we may drive the wheel; tolerate loading hiccups
+        let fresh = now - lastPacket < 3
+        let shouldBeActive = fresh && tuning.enabled && device != nil
+        if shouldBeActive != active {
+            active = shouldBeActive
+            activeSince = now
+            if !active { stop(device, outputSize) }
+            let game = telemetry.game == 2 ? "American Truck Simulator" : "Euro Truck Simulator 2"
+            DispatchQueue.main.async {
+                self.receivingGame = game
+                self.onActiveChange?(shouldBeActive)
+            }
+        }
+        let receivingNow = fresh
+        if receivingNow != wasReceiving {
+            wasReceiving = receivingNow
+            let game = telemetry.game == 2 ? "American Truck Simulator" : "Euro Truck Simulator 2"
+            DispatchQueue.main.async {
+                self.receiving = receivingNow
+                self.receivingGame = game
+                self.log(receivingNow ? "Force feedback: receiving data from \(game)"
+                                      : "Force feedback: \(game) stopped sending data", false)
+            }
+        }
+
+        guard active, let dev = device, now - lastPacket < 0.3, !telemetry.paused else {
+            if outputting { stop(device, outputSize) }
+            return
+        }
+
+        let kmh = Double(abs(telemetry.speed)) * 3.6
+        let fast = min(1, kmh / 60)            // centering builds up to 60 km/h
+        let slow = 1 - min(1, kmh / 20)        // parking weight fades out by 20 km/h
+        let heavy = telemetry.engineOn ? 1.0 : 1.6   // no power steering with the engine off
+
+        // self-aligning: pull toward center, stronger with speed and in corners
+        let spring = -tanh(angle / 100) * (0.12 + 0.88 * fast)
+        let cornering = -max(-1, min(1, Double(telemetry.accelX) / 8)) * 0.4 * fast
+        let center = tuning.centering * (spring + cornering)
+
+        // weight: damping everywhere, plus friction when slow
+        let damper = -max(-1, min(1, velocity / 360)) * (0.08 + 0.3 * slow * heavy) * (0.4 + tuning.weight)
+        let friction = -tanh(velocity / 20) * 0.4 * slow * heavy * tuning.weight
+
+        // road: decaying kick plus a ~30 Hz buzz scaled by how rough the road is
+        bump *= exp(-dt / 0.06)
+        rumble *= exp(-dt / 0.08)
+        phase += dt * 2 * .pi * 30
+        if phase > 2 * .pi { phase -= 2 * .pi }
+        let rolling = min(1, kmh / 8)
+        let roadForce = tuning.road * rolling * (bump * 0.5 + rumble * sin(phase))
+
+        let fadeIn = min(1, (now - activeSince) / 1.0)
+        let force = max(-1, min(1, tuning.strength * fadeIn * (center + damper + friction + roadForce)))
+
+        // 128 = no force, lower = pull left
+        let level = Int((128 + force * 127).rounded())
+        if level != lastLevel || now - lastSend > 0.1 {
+            write(dev, outputSize, G29.constantForce(level))
+            lastLevel = level
+            lastSend = now
+            outputting = true
+        }
+    }
+
+    private func stop(_ device: IOHIDDevice?, _ outputSize: Int) {
+        if let dev = device { write(dev, outputSize, G29.stopForce) }
+        outputting = false
+        lastLevel = -1
+    }
+
+    private func write(_ dev: IOHIDDevice, _ size: Int, _ bytes: [UInt8]) {
+        var buf = [UInt8](repeating: 0, count: size)
+        for (i, b) in bytes.enumerated() where i < buf.count { buf[i] = b }
+        _ = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, buf, buf.count)
+    }
+
+    // MARK: Plugin install
+
+    /// ETS2 and ATS installs in every Steam library.
+    func findGames() {
+        let steam = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Steam")
+        var libraries = [steam]
+        if let vdf = try? String(contentsOf: steam.appendingPathComponent("steamapps/libraryfolders.vdf"), encoding: .utf8),
+           let re = try? NSRegularExpression(pattern: "\"path\"\\s+\"([^\"]+)\"") {
+            for m in re.matches(in: vdf, range: NSRange(vdf.startIndex..., in: vdf)) {
+                if let r = Range(m.range(at: 1), in: vdf) {
+                    let url = URL(fileURLWithPath: vdf[r].replacingOccurrences(of: "\\\\", with: "\\"))
+                    if !libraries.contains(url) { libraries.append(url) }
+                }
+            }
+        }
+        var found: [TruckGame] = []
+        for lib in libraries {
+            for name in ["Euro Truck Simulator 2", "American Truck Simulator"] {
+                let app = lib.appendingPathComponent("steamapps/common/\(name)/\(name).app")
+                if FileManager.default.fileExists(atPath: app.path) {
+                    found.append(TruckGame(name: name, app: app))
+                }
+            }
+        }
+        games = found
+        refreshPluginStates()
+    }
+
+    private var bundledPlugin: URL? {
+        Bundle.main.url(forResource: "g29control_ffb", withExtension: "dylib")
+    }
+
+    func refreshPluginStates() {
+        let bundled = bundledPlugin.flatMap { try? Data(contentsOf: $0) }
+        var states: [String: PluginState] = [:]
+        for g in games {
+            if let installed = try? Data(contentsOf: g.plugin) {
+                states[g.id] = installed == bundled ? .installed : .outdated
+            } else {
+                states[g.id] = .notInstalled
+            }
+        }
+        pluginStates = states
+    }
+
+    func install(_ game: TruckGame) {
+        guard let source = bundledPlugin else {
+            alert("Plugin missing", "This copy of G29 Control doesn't include the game plugin. Rebuild it with ./build.sh.")
+            return
+        }
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: game.plugin.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: game.plugin.path) { try fm.removeItem(at: game.plugin) }
+            try fm.copyItem(at: source, to: game.plugin)
+            log("Force feedback plugin installed into \(game.name)", false)
+            refreshPluginStates()
+            alert("Plugin installed",
+                  "Restart \(game.name) if it's running. When the game asks about advanced SDK features (plugins), click OK.")
+        } catch {
+            refreshPluginStates()
+            failed(error, game: game, action: "install")
+        }
+    }
+
+    func uninstall(_ game: TruckGame) {
+        do {
+            try FileManager.default.removeItem(at: game.plugin)
+            log("Force feedback plugin removed from \(game.name)", false)
+        } catch {
+            failed(error, game: game, action: "remove")
+        }
+        refreshPluginStates()
+    }
+
+    private func failed(_ error: Error, game: TruckGame, action: String) {
+        log("Couldn't \(action) the plugin: \(error.localizedDescription)", true)
+        let a = NSAlert()
+        a.messageText = "Couldn't \(action) the plugin"
+        a.informativeText = "macOS stopped G29 Control from changing \(game.name).\n\nAllow G29 Control under System Settings → Privacy & Security → App Management, then try again.\n\n(\(error.localizedDescription))"
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func alert(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
     }
 }
 
@@ -772,11 +1172,28 @@ final class Updater: ObservableObject {
 struct G29ControlApp: App {
     @StateObject private var wheel: WheelController
     @StateObject private var updater: Updater
+    @StateObject private var ffb: ForceFeedback
     @AppStorage("showMenuBar") private var showMenuBar = true
 
     init() {
         let wheel = WheelController()
+        let ffb = ForceFeedback()
+        ffb.log = { [weak wheel] text, error in wheel?.addLog(text, error: error) }
+        ffb.onActiveChange = { [weak wheel] active in
+            guard let wheel = wheel else { return }
+            wheel.ffbActive = active
+            guard wheel.connected, wheel.pid != G29.pidCompat else { return }
+            if active {
+                wheel.addLog("Force feedback active — the wheel's centering spring is off while you drive")
+                wheel.send(G29.centeringOff, "Centering spring off", quiet: true, quietFailure: true)
+            } else {
+                wheel.addLog("Force feedback stopped — restoring your wheel settings")
+                wheel.applySettings(quietFailure: true, quiet: true)
+            }
+        }
+        wheel.ffb = ffb
         _wheel = StateObject(wrappedValue: wheel)
+        _ffb = StateObject(wrappedValue: ffb)
         _updater = StateObject(wrappedValue: Updater { [weak wheel] text, error in
             wheel?.addLog(text, error: error)
         })
@@ -787,6 +1204,7 @@ struct G29ControlApp: App {
             MainView()
                 .environmentObject(wheel)
                 .environmentObject(updater)
+                .environmentObject(ffb)
                 .frame(minWidth: 1000, minHeight: 680)
         }
         .windowToolbarStyle(.unified)
@@ -1348,6 +1766,8 @@ struct ControlsPanel: View {
             .padding(18)
             .glassCard()
 
+            GameFFBCard()
+
             VStack(alignment: .leading, spacing: 14) {
                 CardTitle("Rev Lights")
                 HStack {
@@ -1391,6 +1811,104 @@ struct ControlsPanel: View {
             .glassButtonStyle(prominent: true)
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(!wheel.connected)
+        }
+    }
+}
+
+struct GameFFBCard: View {
+    @EnvironmentObject var ffb: ForceFeedback
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                CardTitle("Game Force Feedback")
+                Spacer()
+                Toggle("Enabled", isOn: $ffb.enabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+            }
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(ffb.receiving ? Color.green : Color.secondary.opacity(0.5))
+                    .frame(width: 8, height: 8)
+                Text(ffb.receiving ? "Receiving from \(ffb.receivingGame)" : "Waiting for ETS2 or ATS…")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+
+            if ffb.games.isEmpty {
+                HStack {
+                    Text("ETS2 or ATS not found in your Steam library.")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("Look Again") { ffb.findGames() }
+                        .glassButtonStyle()
+                }
+            }
+            ForEach(ffb.games) { game in
+                PluginRow(game: game, state: ffb.pluginStates[game.id] ?? .notInstalled)
+            }
+
+            Divider().padding(.vertical, 2)
+
+            TuningSlider(title: "Strength", value: $ffb.strength)
+            TuningSlider(title: "Centering", value: $ffb.centering)
+            TuningSlider(title: "Road feel", value: $ffb.road)
+            TuningSlider(title: "Low-speed weight", value: $ffb.weight)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard()
+        .onAppear { ffb.refreshPluginStates() }
+    }
+}
+
+struct PluginRow: View {
+    @EnvironmentObject var ffb: ForceFeedback
+    let game: ForceFeedback.TruckGame
+    let state: ForceFeedback.PluginState
+
+    private var shortName: String { game.name.hasPrefix("Euro") ? "ETS2" : "ATS" }
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(shortName) plugin")
+                switch state {
+                case .installed:
+                    Label("Installed", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundColor(.green)
+                case .outdated:
+                    Label("Update available", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundColor(.orange)
+                case .notInstalled:
+                    Text("Not installed").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            Spacer()
+            switch state {
+            case .installed:
+                Button("Remove") { ffb.uninstall(game) }.glassButtonStyle()
+            case .outdated:
+                Button("Update") { ffb.install(game) }.glassButtonStyle(prominent: true)
+            case .notInstalled:
+                Button("Install") { ffb.install(game) }.glassButtonStyle(prominent: true)
+            }
+        }
+        .help(game.app.path)
+    }
+}
+
+struct TuningSlider: View {
+    let title: String
+    @Binding var value: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledValue(title: title, value: "\(Int(value))%")
+            Slider(value: $value, in: 0...100, step: 5)
         }
     }
 }
